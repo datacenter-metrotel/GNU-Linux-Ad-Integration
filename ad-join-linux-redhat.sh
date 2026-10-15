@@ -22,14 +22,26 @@
 # Pregunta siempre por: dominio, usuario y contraseña.
 # Deja todo persistente tras reiniciar.
 #
-# Uso:   sudo ./ad-join-linux-redhat.sh
-#        sudo ./ad-join-linux-redhat.sh --no-rdp     (omitir escritorio + xrdp)
+# Uso:   sudo ./ad-join-linux-redhat.sh            (sólo AD + SSH; SIN escritorio)
+#        sudo ./ad-join-linux-redhat.sh --rdp      (añade escritorio XFCE + xrdp)
 #
+# ---------------------------------------------------------------------------
+# Versión endurecida (hardening frente a 'set -euo pipefail'):
+#   · Se instalan temprano bind-utils (dig) y python3, que el script usa ANTES
+#     de la instalación principal de paquetes (sección 1.5).
+#   · Se blindan con '|| true' los pipelines de extracción/diagnóstico donde un
+#     grep sin coincidencias, un 'head' que corta la tubería (SIGPIPE) o un
+#     'timeout' podían devolver estado !=0 y abortar el script en silencio por
+#     culpa de 'pipefail' (p.ej. OTHER_SEARCH, 'realm discover | head', DOM_SECTION,
+#     la medición de desfase NTP, etc.). El valor vacío es el resultado correcto
+#     en esos casos y los chequeos posteriores ya lo contemplan.
+# ---------------------------------------------------------------------------
 set -euo pipefail
 # ---------------------------------------------------------------- constantes
 DOMAIN_DEFAULT="metrotel.local"
 LOG="/var/log/ad-join-linux.log"
-INSTALL_RDP=1
+# Por defecto NO se instala escritorio/RDP (servidores headless). Se activa con --rdp.
+INSTALL_RDP=0
 # Servidores corporativos OBLIGATORIOS de DNS y NTP (requisito de infraestructura).
 # Son la única fuente válida de resolución y de hora para los equipos del dominio.
 CORP_DNS=(172.18.194.36 172.18.194.37)
@@ -43,7 +55,8 @@ TPL_EXACT='template|plantilla|debian|ubuntu|linux|rhel|redhat|red-?hat|centos|ro
 
 for arg in "$@"; do
   case "$arg" in
-    --no-rdp) INSTALL_RDP=0 ;;
+    --rdp)    INSTALL_RDP=1 ;;
+    --no-rdp) INSTALL_RDP=0 ;;   # aceptado por compatibilidad (ya es el valor por defecto)
     -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "Opción desconocida: $arg" >&2; exit 2 ;;
   esac
@@ -105,13 +118,76 @@ read -rp $'\n  ¿Continuar? [s/N]: ' GO
 [[ "${GO,,}" == s* ]] || die "Cancelado por el usuario."
 
 # ============================================================================
+# 1.5 REPOSITORIOS Y DEPENDENCIAS — se habilitan EPEL + CRB/PowerTools y se
+# instalan POR ADELANTADO todos los paquetes que provee cada comando que el
+# script va a usar (dig, python3, hostname, realm, adcli, kinit/klist,
+# authselect, chronyc, getenforce, pamtester, nmcli, sshd y —salvo --no-rdp—
+# xrdp/XFCE). Así ningún paso posterior se topa con un binario ausente. Es
+# idempotente: lo que ya está instalado simplemente se omite. Las instalaciones
+# puntuales que quedan más abajo pasan a ser redes de seguridad (no-ops rápidos).
+# ============================================================================
+step "Habilitando repositorios de paquetes (EPEL + CRB/PowerTools)"
+dnf install -y -q dnf-plugins-core >/dev/null
+if ! rpm -q epel-release >/dev/null 2>&1; then
+  if ! dnf install -y -q epel-release >/dev/null 2>&1; then
+    RHEL_VER="$(rpm -E %rhel)"
+    dnf install -y -q "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${RHEL_VER}.noarch.rpm" >/dev/null \
+      || warn "No se pudo instalar epel-release automáticamente. xrdp/pamtester podrían fallar más adelante."
+  fi
+  ok "EPEL instalado"
+else
+  ok "EPEL ya estaba instalado"
+fi
+if grep -qi '^NAME="Red Hat' /etc/os-release 2>/dev/null; then
+  # RHEL con suscripción activa.
+  subscription-manager repos --enable "codeready-builder-for-rhel-$(rpm -E %rhel)-$(arch)-rpms" >/dev/null 2>&1 \
+    && ok "CodeReady Builder habilitado" \
+    || warn "No se pudo habilitar CodeReady Builder (¿sistema sin suscripción activa?). xrdp podría fallar al resolver dependencias."
+else
+  # Rocky/Alma/CentOS Stream.
+  dnf config-manager --set-enabled crb        >/dev/null 2>&1 \
+    || dnf config-manager --set-enabled powertools >/dev/null 2>&1 \
+    || warn "No se encontró el repo crb/powertools. Actívalo manualmente si xrdp falla al instalar."
+  ok "repositorio de dependencias (crb/powertools) habilitado"
+fi
+dnf makecache -q >/dev/null 2>&1 || true
+
+step "Instalando por adelantado todas las dependencias del script"
+# Cada comando del script → su paquete (los binarios de coreutils/util-linux/
+# systemd/rpm/dnf/NetworkManager ya vienen en el sistema base).
+PKGS=(
+  bind-utils python3 hostname iproute sudo
+  chrony openssh-server
+  realmd sssd sssd-tools sssd-common
+  adcli samba-common-tools samba-common krb5-workstation
+  oddjob oddjob-mkhomedir authselect
+  openldap-clients policycoreutils-python-utils
+  libselinux-utils pamtester
+)
+# Escritorio remoto (sólo si NO se pasó --no-rdp).
+if ((INSTALL_RDP)); then
+  PKGS+=( xrdp xorgxrdp dbus-x11 xorg-x11-server-Xorg polkit )
+fi
+dnf install -y -q "${PKGS[@]}" >/dev/null 2>&1 \
+  && ok "dependencias instaladas por adelantado (${#PKGS[@]} paquetes solicitados)" \
+  || warn "algún paquete del lote no se pudo instalar; se reintentará en su sección correspondiente."
+if ((INSTALL_RDP)); then
+  dnf groupinstall -y -q "Xfce" >/dev/null 2>&1 \
+    || dnf install -y -q xfce4-session xfce4-panel xfwm4 xfdesktop xfce4-terminal >/dev/null 2>&1 \
+    || warn "no se pudo instalar el entorno XFCE todavía; se reintentará en la sección de RDP."
+  ok "entorno XFCE preparado"
+fi
+command -v nmcli >/dev/null 2>&1 \
+  || warn "nmcli no está presente; se requiere NetworkManager para fijar el DNS corporativo."
+
+# ============================================================================
 # 2. HOSTNAME — nunca el de la plantilla; debe coincidir con DNS/administrador
 # ============================================================================
 step "Verificando identidad del host (hostname / DNS)"
 CUR_SHORT="$(hostname -s 2>/dev/null || cat /etc/hostname)"
-PRIMARY_IF="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')"
-[[ -n "$PRIMARY_IF" ]] || PRIMARY_IF="$(ip -4 -br addr show scope global | awk '{print $1; exit}')"
-IP_ADDR="$(ip -4 -o addr show dev "$PRIMARY_IF" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+PRIMARY_IF="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}' || true)"
+[[ -n "$PRIMARY_IF" ]] || PRIMARY_IF="$(ip -4 -br addr show scope global | awk '{print $1; exit}' || true)"
+IP_ADDR="$(ip -4 -o addr show dev "$PRIMARY_IF" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)"
 [[ -n "$IP_ADDR" ]] || die "No se pudo determinar la IP de este host."
 ok "interfaz $PRIMARY_IF — IP $IP_ADDR"
 
@@ -160,9 +236,9 @@ derive_sam_name() {
 # ¿Qué nombre dice el DNS para nuestra IP? (fuente de verdad preferente)
 DNS_NAME=""
 if command -v dig >/dev/null 2>&1; then
-  DNS_NAME="$(dig +short -x "$IP_ADDR" 2>/dev/null | head -1 | sed 's/\.$//')"
+  DNS_NAME="$(dig +short -x "$IP_ADDR" 2>/dev/null | head -1 | sed 's/\.$//' || true)"
 else
-  DNS_NAME="$(getent hosts "$IP_ADDR" 2>/dev/null | awk '{print $2}' | head -1)"
+  DNS_NAME="$(getent hosts "$IP_ADDR" 2>/dev/null | awk '{print $2}' | head -1 || true)"
 fi
 DNS_SHORT="${DNS_NAME%%.*}"
 if [[ -n "$DNS_NAME" ]]; then
@@ -268,36 +344,9 @@ backup /etc/hosts
   || warn "hostname -f no devuelve $FQDN todavía (se corrige al reiniciar)."
 
 # ---------------------------------------------------------------------------
-# [RHEL] EPEL + CRB/PowerTools: ahí viven xrdp, xorgxrdp, pamtester y el grupo
-# Xfce. En RHEL propiamente dicho (con suscripción) hace falta además el canal
-# CodeReady Builder para las dependencias de EPEL; en Rocky/Alma/CentOS Stream
-# el repo equivalente se llama 'crb' (9) o 'powertools' (8).
+# [RHEL] EPEL + CRB/PowerTools y la instalación de paquetes ya se hicieron por
+# adelantado en la sección 1.5. Aquí no se repiten.
 # ---------------------------------------------------------------------------
-step "Habilitando EPEL y el repositorio de dependencias (CRB/PowerTools)"
-dnf install -y -q dnf-plugins-core >/dev/null
-if ! rpm -q epel-release >/dev/null 2>&1; then
-  if ! dnf install -y -q epel-release >/dev/null 2>&1; then
-    RHEL_VER="$(rpm -E %rhel)"
-    dnf install -y -q "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${RHEL_VER}.noarch.rpm" >/dev/null \
-      || warn "No se pudo instalar epel-release automáticamente. xrdp/pamtester podrían fallar más adelante."
-  fi
-  ok "EPEL instalado"
-else
-  ok "EPEL ya estaba instalado"
-fi
-if grep -qi '^NAME="Red Hat' /etc/os-release 2>/dev/null; then
-  # RHEL con suscripción activa.
-  subscription-manager repos --enable "codeready-builder-for-rhel-$(rpm -E %rhel)-$(arch)-rpms" >/dev/null 2>&1 \
-    && ok "CodeReady Builder habilitado" \
-    || warn "No se pudo habilitar CodeReady Builder (¿sistema sin suscripción activa?). xrdp podría fallar al resolver dependencias."
-else
-  # Rocky/Alma/CentOS Stream.
-  dnf config-manager --set-enabled crb        >/dev/null 2>&1 \
-    || dnf config-manager --set-enabled powertools >/dev/null 2>&1 \
-    || warn "No se encontró el repo crb/powertools. Actívalo manualmente si xrdp falla al instalar."
-  ok "repositorio de dependencias (crb/powertools) habilitado"
-fi
-dnf makecache -q >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # [RHEL] DNS corporativo: RHEL no usa systemd-resolved. NetworkManager escribe
@@ -312,7 +361,7 @@ CONN_NAME="$(nmcli -t -f DEVICE,NAME,STATE connection show --active \
 [[ -n "$CONN_NAME" ]] || die "No se encontró una conexión NetworkManager activa para $PRIMARY_IF."
 DNS_CSV="$(IFS=,; echo "${CORP_DNS[*]}")"
 OTHER_SEARCH="$(nmcli -g ipv4.dns-search connection show "$CONN_NAME" 2>/dev/null \
-                | tr ',' '\n' | grep -vxF "$DOMAIN" | grep -v '^--$' | grep -v '^$' | tr '\n' ',' | sed 's/,$//')"
+                | tr ',' '\n' | grep -vxF "$DOMAIN" | grep -v '^--$' | grep -v '^$' | tr '\n' ',' | sed 's/,$//' || true)"
 SEARCH_CSV="${DOMAIN}${OTHER_SEARCH:+,${OTHER_SEARCH}}"
 nmcli connection modify "$CONN_NAME" \
   ipv4.dns "$DNS_CSV" \
@@ -364,7 +413,7 @@ systemctl restart chronyd
 sleep 3
 chronyc -a makestep >/dev/null 2>&1 || true   # salto inmediato
 sleep 2
-SKEW="$(chronyc tracking 2>/dev/null | awk -F'[ ]+' '/System time/{print $4}')"
+SKEW="$(chronyc tracking 2>/dev/null | awk -F'[ ]+' '/System time/{print $4}' || true)"
 [[ -n "$SKEW" ]] && ok "desfase respecto a las fuentes configuradas: ${SKEW}s"
 # Lo que decide si Kerberos funciona es el desfase contra el reloj del dominio,
 # no contra la hora UTC real. Se mide por NTP contra el servidor corporativo.
@@ -377,7 +426,7 @@ try:
     d=s.recv(48); t=struct.unpack('!12I',d)[10]-2208988800
     print('%.1f' % abs(t-b))
 except Exception: print('')
-" "$DC1" 2>/dev/null)"
+" "$DC1" 2>/dev/null || true)"
 if [[ -n "$DC_SKEW" ]]; then
   if awk -v s="$DC_SKEW" 'BEGIN{exit !(s>120)}'; then
     warn "Desfase con el DC ${DC1}: ${DC_SKEW}s — Kerberos falla por encima de 300s."
@@ -411,7 +460,50 @@ ok "realmd, sssd, adcli, krb5, oddjob-mkhomedir instalados"
 step "Comprobando visibilidad del dominio $DOMAIN"
 realm discover "$DOMAIN" >/dev/null 2>&1 \
   || die "No se ve el dominio '$DOMAIN'. Revisa DNS y conectividad con los DCs."
-realm discover "$DOMAIN" 2>/dev/null | sed 's/^/  /' | head -8
+realm discover "$DOMAIN" 2>/dev/null | sed 's/^/  /' | head -8 || true
+
+# ---------------------------------------------------------------------------
+# Pre-chequeo de credenciales con Kerberos ANTES de intentar el join. 'realm
+# join' con una contraseña VENCIDA falla con un genérico "Cannot read password"
+# que despista; aquí se detecta y se avisa con claridad. Se usa un ccache de
+# ARCHIVO (KRB5CCNAME=FILE:...) porque el ccache por defecto suele ser KCM
+# (sssd-kcm), que todavía no está activo y haría fallar a kinit sin tener que ver
+# con la contraseña.
+# ---------------------------------------------------------------------------
+step "Comprobando las credenciales de '$AD_USER' (contraseña vigente / vencida)"
+KC_CHK="$(mktemp /tmp/adjoin-kinit.XXXXXX 2>/dev/null || echo /tmp/adjoin-kinit.cc)"
+# Se captura el código de retorno real de kinit (rc=0 => contraseña vigente),
+# sin que 'set -e' aborte: el patrón '… && KRC=0 || KRC=$?' lo neutraliza.
+KINIT_OUT="$(printf '%s\n' "$AD_PASS" | KRB5CCNAME="FILE:$KC_CHK" kinit "${AD_USER}@${REALM}" 2>&1)" && KRC=0 || KRC=$?
+kdestroy -c "FILE:$KC_CHK" >/dev/null 2>&1 || true
+rm -f "$KC_CHK"
+if (( KRC == 0 )); then
+  ok "contraseña VIGENTE y credenciales válidas para ${AD_USER}@${REALM}"
+elif echo "$KINIT_OUT" | grep -qiE 'password .*expired|key expired|expired while|Password expired'; then
+  warn "La contraseña de '${AD_USER}' está VENCIDA en Active Directory."
+  echo "     Kerberos informa:"
+  echo "$KINIT_OUT" | sed 's/^/       /' | head -3
+  echo "     El join NO puede continuar hasta renovarla. Opciones:"
+  echo "       · Renovala vos:  kinit ${AD_USER}@${REALM}   (te deja fijar una nueva)"
+  echo "       · Que un admin de AD la resetee y destilde 'cambiar en el próximo inicio'."
+  echo "       · Usá otra cuenta con permiso de join y contraseña vigente."
+  die "Contraseña vencida: renovala y volvé a ejecutar el script."
+elif echo "$KINIT_OUT" | grep -qiE 'Preauthentication failed|Password incorrect|Generic preauth|Invalid argument while'; then
+  warn "Contraseña INCORRECTA para '${AD_USER}'."
+  echo "$KINIT_OUT" | sed 's/^/       /' | head -2
+  die "Credenciales inválidas: revisá usuario/contraseña y volvé a ejecutar."
+elif echo "$KINIT_OUT" | grep -qiE 'not found in Kerberos database|Client .* unknown|KDC_ERR_C_PRINCIPAL_UNKNOWN'; then
+  warn "El usuario '${AD_USER}' no existe en el realm ${REALM}."
+  echo "$KINIT_OUT" | sed 's/^/       /' | head -2
+  die "Usuario inexistente: revisá el nombre (sin '@' ni dominio) y volvé a ejecutar."
+elif echo "$KINIT_OUT" | grep -qiE 'Clock skew|Kerberos.*skew'; then
+  warn "Desfase de reloj excesivo contra el KDC (Kerberos rechaza > 300s)."
+  echo "$KINIT_OUT" | sed 's/^/       /' | head -2
+  die "Corregí la hora (revisá chrony/el DC) y volvé a ejecutar."
+else
+  warn "No se pudo validar la credencial por un motivo inesperado; se intentará el join igualmente."
+  echo "$KINIT_OUT" | sed 's/^/       /' | head -3
+fi
 
 if realm list 2>/dev/null | grep -qiE "^${DOMAIN}\$|domain-name: ${DOMAIN}"; then
   warn "Este equipo ya está unido a $DOMAIN."
@@ -462,7 +554,7 @@ if [[ -f /etc/krb5.keytab ]]; then
     ok "el keytab contiene principales con el FQDN completo"
   else
     warn "el keytab no muestra el FQDN '$FQDN'. Principales presentes:"
-    klist -k /etc/krb5.keytab 2>/dev/null | awk 'NR>3{print "      "$2}' | sort -u | head -8
+    klist -k /etc/krb5.keytab 2>/dev/null | awk 'NR>3{print "      "$2}' | sort -u | head -8 || true
   fi
 fi
 
@@ -479,7 +571,7 @@ SSSD_CONF="/etc/sssd/sssd.conf"
 # (p. ej. '[domain/Metrotel.local]'), que NO tiene por qué coincidir con lo que
 # escribió el usuario. Hay que detectarla del fichero: si se asume minúsculas,
 # el sed no encuentra la sección y las claves nunca se insertan — en silencio.
-DOM_SECTION="$(grep -oP '^\[domain/\K[^]]+' "$SSSD_CONF" 2>/dev/null | head -1)"
+DOM_SECTION="$(grep -oP '^\[domain/\K[^]]+' "$SSSD_CONF" 2>/dev/null | head -1 || true)"
 [[ -n "$DOM_SECTION" ]] || die "No se encontró ninguna sección [domain/...] en $SSSD_CONF"
 ok "sección de configuración detectada: [domain/${DOM_SECTION}]"
 
@@ -519,32 +611,60 @@ if [[ "$SAM_NAME" != "$NEW_SHORT" ]]; then
 fi
 chown root:root "$SSSD_CONF"; chmod 600 "$SSSD_CONF"
 
-# [RHEL] Igual que en Debian 13, los responders de SSSD se activan por socket.
-# Si además aparecen en la línea 'services' de sssd.conf, 'sssd_check_socket_
-# activated_responders' aborta con status=17 y los .socket quedan en 'failed'
-# (el login sigue funcionando porque sssd.service arranca los responders por
-# su cuenta, así que el fallo pasa desapercibido). Se elimina la línea para
-# dejar la activación a systemd.
+# [RHEL] Responders de SSSD en MODO CLÁSICO (arrancados por el monitor vía la
+# línea 'services'), NO por socket-activation. Motivo: en RHEL 9 el monitor
+# (sssd.service) corre como root, pero las unidades sssd-*.socket activan al
+# responder con User=sssd (uid distinto). El responder de PAM entonces exige que
+# el socket privado del backend sea de ese uid y, al ser de root, aborta con
+# 'sbus-dp ... must be owned by uid [NNN]' → "Failed to connect to backend
+# server". Resultado: NSS resuelve pero PAM no, y NINGÚN usuario puede entrar
+# aunque el join esté perfecto. Fijando 'services = nss, pam' y desactivando la
+# socket-activation, el monitor arranca nss y pam como el mismo usuario que el
+# backend y todo queda consistente.
 if grep -qE '^\s*services\s*=' "$SSSD_CONF"; then
-  sed -i -E '/^\s*services\s*=/d' "$SSSD_CONF"
-  ok "eliminada la línea 'services' de $SSSD_CONF (colisiona con los sockets de systemd)"
+  sed -i -E 's|^\s*services\s*=.*|services = nss, pam|' "$SSSD_CONF"
+else
+  sed -i '/^\[sssd\]/a services = nss, pam' "$SSSD_CONF"
 fi
+ok "responders fijados: 'services = nss, pam' (modo clásico, sin socket-activation)"
+
+# Desactiva las unidades socket de responder de sssd (incluidas las '-priv'): si
+# quedan habilitadas chocan con 'services=' y aparecen como 'failed'.
+# IMPORTANTE: se EXCLUYE 'sssd-kcm.socket'. KCM no es un responder: es el servidor
+# de caché de credenciales Kerberos. El krb5.conf de RHEL usa
+# 'default_ccache_name = KCM:', de modo que si KCM no corre la AUTENTICACIÓN por
+# SSH falla con 'krb5_child: No KCM server found' AUNQUE NSS y PAM resuelvan. Por
+# eso KCM se deja aparte y se habilita explícitamente más abajo.
+SSSD_SOCKS="$(systemctl list-unit-files --no-legend 'sssd-*.socket' 2>/dev/null | awk '{print $1}' | grep -v '^sssd-kcm' || true)"
+if [[ -n "$SSSD_SOCKS" ]]; then
+  # shellcheck disable=SC2086
+  systemctl stop    $SSSD_SOCKS >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086
+  systemctl disable $SSSD_SOCKS >/dev/null 2>&1 || true
+fi
+find /etc/systemd/system/sssd.service.wants -maxdepth 1 -name 'sssd-*.socket' ! -name 'sssd-kcm.socket' -delete 2>/dev/null || true
 
 systemctl enable sssd >/dev/null 2>&1
-systemctl reset-failed 'sssd-*.socket' >/dev/null 2>&1 || true
-systemctl restart sssd
+systemctl daemon-reload
+# Pipes viejos fuera: se recrean con el propietario correcto al arrancar limpio.
+systemctl stop sssd >/dev/null 2>&1 || true
+rm -f /var/lib/sss/pipes/nss /var/lib/sss/pipes/pam /var/lib/sss/pipes/pac 2>/dev/null || true
+rm -f /var/lib/sss/pipes/private/sbus-* /var/lib/sss/pipes/private/pam /var/lib/sss/pipes/private/nss 2>/dev/null || true
+systemctl reset-failed 'sssd*' >/dev/null 2>&1 || true
+systemctl start sssd
 sleep 4
 systemctl is-active --quiet sssd && ok "sssd activo y habilitado al arranque" || die "sssd no arrancó. Revisa: journalctl -u sssd"
 
-# 'pac' es implícito con id_provider=ad: SSSD lo arranca siempre él mismo, por lo
-# que su socket colisiona incluso sin la línea 'services'. Se deshabilita según
-# recomienda el propio mensaje de error de SSSD.
-for SOCK in $(systemctl list-units --state=failed --all --no-legend 'sssd-*.socket' 2>/dev/null \
-                | awk '{for(i=1;i<=NF;i++) if($i ~ /\.socket$/){print $i; break}}'); do
-  systemctl disable --now "$SOCK" >/dev/null 2>&1
-  systemctl reset-failed "$SOCK" >/dev/null 2>&1
-  ok "socket redundante '$SOCK' deshabilitado (el responder lo gestiona sssd)"
-done
+# KCM: servidor de caché de tickets Kerberos. Imprescindible para que el login
+# almacene el TGT del usuario; sin él, SSH falla con 'No KCM server found'.
+systemctl enable --now sssd-kcm.socket >/dev/null 2>&1 \
+  && ok "sssd-kcm (caché de credenciales Kerberos) activo y habilitado" \
+  || warn "no se pudo habilitar sssd-kcm.socket; el login podría fallar con 'krb5_child: No KCM server found'."
+
+# Verificación dura: responder de PAM realmente atendiendo. Si el pipe de PAM no
+# existe, el login fallaría pese a que NSS resuelva.
+[[ -S /var/lib/sss/pipes/pam ]] && ok "responder PAM activo (pipe /var/lib/sss/pipes/pam presente)" \
+  || warn "el pipe de PAM no aparece; revisa 'journalctl -u sssd' y /var/log/sssd/sssd_pam.log"
 
 # ============================================================================
 # 7. PAM — authselect (SSSD + creación automática del home)
@@ -734,7 +854,7 @@ fi
 # 12. VERIFICACIÓN
 # ============================================================================
 step "Verificación"
-for svc in sssd chronyd sshd oddjobd $( ((INSTALL_RDP)) && echo "xrdp xrdp-sesman" ); do
+for svc in sssd chronyd sshd oddjobd $( ((INSTALL_RDP)) && echo "xrdp xrdp-sesman" || true ); do
   printf '  %-14s ' "$svc"
   act=$(systemctl is-active "$svc" 2>/dev/null || echo inactive)
   ena=$(systemctl is-enabled "$svc" 2>/dev/null || echo disabled)
@@ -749,23 +869,103 @@ echo "  Dominio : $(realm list 2>/dev/null | head -1 || echo '??')"
 echo "  Hostname: $(hostname -f 2>/dev/null || hostname)"
 echo "  IP      : $IP_ADDR"
 
-# Prueba real de resolución: si esto falla, los usuarios no podrán entrar.
-step "Probando resolución de un usuario del dominio"
-if [[ "$USE_FQN" == "True" ]]; then TEST_ID="${AD_USER}@${DOMAIN}"; else TEST_ID="$AD_USER"; fi
-if id "$TEST_ID" >/dev/null 2>&1; then
-  ok "id $TEST_ID → resuelto correctamente"
+# Contador de problemas que IMPIDEN el login. Determina el veredicto final: sólo
+# se declara el éxito de extremo a extremo si vale 0.
+HC_ERR=0
+
+# --- 12.a Unidades de SSSD en estado 'failed' --------------------------------
+# Un 'sssd-*.socket' en 'failed' es la huella de la socket-activation chocando
+# con 'services='; no siempre rompe el login, pero ensucia el arranque y suele
+# acompañar al fallo del responder de PAM. Se avisa siempre.
+step "Estado de las unidades de SSSD"
+if systemctl is-active --quiet sssd; then
+  ok "sssd activo"
 else
-  warn "No se pudo resolver '$TEST_ID' contra AD."
-  warn "Diagnostica con:  sssctl domain-status ${DOM_SECTION}  y  journalctl -u sssd -n 50"
+  warn "sssd NO está activo: sin él no hay resolución ni login."
+  ((HC_ERR++)) || true
+fi
+FAILED_SSSD="$(systemctl --failed --all --no-legend 'sssd*' 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
+if [[ -n "${FAILED_SSSD// /}" ]]; then
+  warn "Unidades de SSSD en 'failed': ${FAILED_SSSD}"
+  echo "     Límpialas (modo clásico, sin socket-activation):"
+  echo "       systemctl disable --now ${FAILED_SSSD}"
+  echo "       systemctl reset-failed ${FAILED_SSSD}"
+else
+  ok "ninguna unidad de SSSD en estado 'failed'"
 fi
 
-# Ticket Kerberos: confirma que el keytab y el realm son correctos.
-if printf '%s' "$AD_PASS" | kinit "${AD_USER}@${REALM}" >/dev/null 2>&1; then
+# --- 12.b Responders realmente atendiendo (pipes NSS y PAM) ------------------
+# El síntoma que más despista: el join está perfecto pero el pipe del responder
+# no existe, así que NSS o PAM no contestan y NADIE entra. Se comprueba el pipe.
+step "Responders de SSSD atendiendo (NSS y PAM)"
+if [[ -S /var/lib/sss/pipes/nss ]]; then
+  ok "responder NSS: /var/lib/sss/pipes/nss presente"
+else
+  warn "responder NSS CAÍDO (no existe /var/lib/sss/pipes/nss): 'id' y 'getent' fallarán."
+  echo "     Revisa 'services = nss, pam' en $SSSD_CONF y que el .socket NSS no quede habilitado."
+  ((HC_ERR++)) || true
+fi
+if [[ -S /var/lib/sss/pipes/pam ]]; then
+  ok "responder PAM: /var/lib/sss/pipes/pam presente"
+else
+  warn "responder PAM CAÍDO (no existe /var/lib/sss/pipes/pam): NINGÚN login funcionará."
+  echo "     Causa típica: socket-activation arrancando el responder con un usuario"
+  echo "     distinto al del backend. Busca 'must be owned by uid' en /var/log/sssd/sssd_pam.log."
+  ((HC_ERR++)) || true
+fi
+# KCM: sin el servidor de caché de tickets Kerberos, la AUTENTICACIÓN por SSH
+# falla con 'krb5_child: No KCM server found' aunque NSS y PAM resuelvan bien.
+if systemctl is-active --quiet sssd-kcm.socket || [[ -S /var/run/.heim_org.h5l.kcm-socket ]]; then
+  ok "KCM (caché de tickets Kerberos) activo"
+else
+  warn "KCM CAÍDO (sssd-kcm.socket inactivo): el login fallará con 'No KCM server found'."
+  echo "     Habilítalo con: systemctl enable --now sssd-kcm.socket"
+  ((HC_ERR++)) || true
+fi
+
+# --- 12.c Backend Online contra los DC ---------------------------------------
+if command -v sssctl >/dev/null 2>&1; then
+  DSTAT="$(sssctl domain-status "$DOM_SECTION" 2>/dev/null | awk -F': *' '/Online status/{print $2; exit}' || true)"
+  case "${DSTAT,,}" in
+    *online*)  ok "backend SSSD Online contra '${DOM_SECTION}'" ;;
+    *offline*) warn "backend SSSD OFFLINE: no alcanza a los DC (DNS, puertos 389/88/445/3268 o reloj)."; ((HC_ERR++)) || true ;;
+    *)         warn "no se pudo determinar el estado Online del backend (sssctl domain-status)." ;;
+  esac
+fi
+
+# --- 12.d Resolución NSS real + contraste con InfoPipe -----------------------
+# Se prueba por NSS ('getent', el camino que usan sshd/login), no sólo 'id'. Si
+# NSS falla pero el backend SÍ ve al usuario por InfoPipe, el problema es el
+# responder/NSS, no el join ni AD: se dice con todas las letras.
+step "Probando resolución de un usuario del dominio"
+if [[ "$USE_FQN" == "True" ]]; then TEST_ID="${AD_USER}@${DOMAIN}"; else TEST_ID="$AD_USER"; fi
+if getent passwd "$TEST_ID" >/dev/null 2>&1; then
+  ok "getent passwd $TEST_ID → resuelto por NSS"
+  getent passwd "$TEST_ID" 2>/dev/null | sed 's/^/       /' | head -1 || true
+else
+  warn "NSS NO resuelve '$TEST_ID' ('getent passwd' vacío)."
+  ((HC_ERR++)) || true
+  if command -v sssctl >/dev/null 2>&1 && sssctl user-checks "$TEST_ID" 2>/dev/null | grep -qiE '^ *- *name:'; then
+    warn "PERO el backend SÍ lo encuentra por InfoPipe → el fallo es del responder NSS,"
+    warn "no del join ni de AD. El pipe /var/lib/sss/pipes/nss no está atendiendo."
+    echo "     Solución: 'services = nss, pam' en $SSSD_CONF y desactivar la socket-activation de sssd."
+  else
+    warn "El backend tampoco lo encuentra. Revisa el grupo permitido, el DNS y:"
+    warn "  sssctl domain-status ${DOM_SECTION}   journalctl -u sssd -n 50"
+  fi
+fi
+
+# Ticket Kerberos: confirma que el keytab y el realm son correctos. Se usa un
+# ccache de ARCHIVO para no depender de KCM (sssd-kcm), que puede no estar activo
+# y daría un falso negativo sin relación con la contraseña.
+KC_VER="$(mktemp /tmp/adjoin-kinit.XXXXXX 2>/dev/null || echo /tmp/adjoin-kinit-ver.cc)"
+if printf '%s\n' "$AD_PASS" | KRB5CCNAME="FILE:$KC_VER" kinit "${AD_USER}@${REALM}" >/dev/null 2>&1; then
   ok "kinit correcto: Kerberos operativo"
-  kdestroy >/dev/null 2>&1 || true
+  kdestroy -c "FILE:$KC_VER" >/dev/null 2>&1 || true
 else
   warn "kinit falló — revisa el realm ($REALM) y el desfase de reloj."
 fi
+rm -f "$KC_VER"
 unset AD_PASS
 
 # Resolver al usuario NO garantiza que pueda entrar: la fase 'account' de PAM
@@ -777,28 +977,45 @@ if ! command -v pamtester >/dev/null 2>&1; then
   dnf install -y -q pamtester >/dev/null 2>&1 || true
 fi
 if command -v pamtester >/dev/null 2>&1; then
-  if pamtester sshd "$TEST_ID" acct_mgmt >/dev/null 2>&1; then
-    ok "PAM autoriza el login de '$TEST_ID' — SSH y RDP operativos"
-    echo -e "\n${c_grn}${c_bld}Integración con AD verificada de extremo a extremo.${c_rst}"
+  PAM_OUT="$(pamtester sshd "$TEST_ID" acct_mgmt 2>&1 || true)"
+  if echo "$PAM_OUT" | grep -qiE 'account management done'; then
+    ok "PAM autoriza el login de '$TEST_ID' — SSH$( ((INSTALL_RDP)) && echo ' y RDP' || true ) operativos"
   else
-    warn "PAM RECHAZA el login de '$TEST_ID' aunque el usuario se resuelva bien."
+    warn "PAM RECHAZA el login de '$TEST_ID'."
+    ((HC_ERR++)) || true
     echo "     Detalle:"
-    pamtester sshd "$TEST_ID" acct_mgmt 2>&1 | sed 's/^/       /' | head -4
-    echo "     Causas más frecuentes:"
-    echo "       · GPO ilegible → ya mitigado con ad_gpo_ignore_unreadable = True"
-    echo "       · el usuario no está en el grupo permitido → realm permit -g 'GRUPO@${DOMAIN}'"
-    echo "       · denegación de SELinux → ausearch -m avc -ts recent"
-    echo "       · revisa:  journalctl -u sssd | grep -i denied"
+    echo "$PAM_OUT" | sed 's/^/       /' | head -4
+    # Mensaje específico: el responder de PAM no conecta al backend (el fallo de
+    # propietario de socket que detectamos). 'id' puede funcionar y aun así PAM no.
+    if echo "$PAM_OUT" | grep -qiE 'cannot retrieve authentication info|authentication service'; then
+      warn "Pinta a responder de PAM caído / sin conexión al backend (no a permisos)."
+      echo "       · Revisa /var/log/sssd/sssd_pam.log (busca 'must be owned by uid')."
+      echo "       · Asegura 'services = nss, pam' y sin socket-activation de sssd."
+    else
+      echo "     Causas más frecuentes:"
+      echo "       · GPO ilegible → ya mitigado con ad_gpo_ignore_unreadable = True"
+      echo "       · el usuario no está en el grupo permitido → realm permit -g 'GRUPO@${DOMAIN}'"
+      echo "       · denegación de SELinux → ausearch -m avc -ts recent"
+      echo "       · revisa:  journalctl -u sssd | grep -i denied"
+    fi
   fi
 else
   warn "pamtester no disponible: no se pudo verificar la autorización."
   warn "Compruébalo manualmente con un SSH real antes de dar por buena la instalación."
 fi
 
+# --- Veredicto final: sólo 'OK de extremo a extremo' si NO hubo fallos duros ---
+if (( HC_ERR == 0 )); then
+  echo -e "\n${c_grn}${c_bld}Integración con AD verificada de extremo a extremo (servicios + NSS + PAM + backend Online).${c_rst}"
+else
+  echo -e "\n${c_red}${c_bld}La unión al dominio se completó, pero el chequeo de salud encontró ${HC_ERR} problema(s) que impiden el login.${c_rst}"
+  echo -e "${c_red}Revisa los avisos [!] de arriba y el log $LOG antes de dar por buena la instalación.${c_rst}"
+fi
+
 cat <<EOF
 ${c_bld}Cómo entran los usuarios${c_rst}
   SSH : ssh ${TEST_ID}@${IP_ADDR}
-$( ((INSTALL_RDP)) && echo "  RDP : ${IP_ADDR}:3389  (usuario: ${TEST_ID})" )
+$( ((INSTALL_RDP)) && echo "  RDP : ${IP_ADDR}:3389  (usuario: ${TEST_ID})" || true )
 
 ${c_bld}Notas${c_rst}
   · Log completo: $LOG
@@ -807,7 +1024,7 @@ ${c_bld}Notas${c_rst}
     de inicio de sesión configurada para Linux, cámbialo a 'enforcing' en
     /etc/sssd/sssd.conf.
 $( [[ -z "$AD_GROUP" ]] && echo "  · Ahora puede entrar CUALQUIER usuario del dominio. Para restringir:
-    realm deny --all && realm permit -g 'GRUPO@${DOMAIN}'" )
+    realm deny --all && realm permit -g 'GRUPO@${DOMAIN}'" || true )
   · Si la IP no tenía PTR, pide al administrador de DNS los registros A y PTR
     de ${FQDN} → ${IP_ADDR}.
   · El DNS corporativo quedó fijado en el perfil de NetworkManager de la
