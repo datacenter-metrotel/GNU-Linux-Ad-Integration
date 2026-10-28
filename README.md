@@ -38,7 +38,9 @@ persistencia de red/DNS, PAM y nombres de servicio). Ver la sección
    las constantes `CORP_DNS` / `CORP_NTP` del script (ver
    [Configuración](#configuración-antes-de-usar)), de forma persistente tras
    reiniciar, y verifica que resuelven registros SRV del dominio antes de
-   seguir.
+   seguir. En RHEL/Rocky/Alma añade `confdir /etc/chrony.d` a
+   `/etc/chrony.conf` (no viene por defecto y sin él el NTP corporativo no se
+   carga) y aborta si chrony no termina usando `CORP_NTP` como fuente.
 4. **Paquetes** — instala `realmd`, `sssd`, `adcli`, `krb5`, `oddjob-mkhomedir`
    y demás dependencias (habilitando repos extra si la distro los necesita).
 5. **Unión al dominio** — `realm join` con el hostname completo, más
