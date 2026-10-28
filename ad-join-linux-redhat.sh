@@ -35,6 +35,9 @@
 #     culpa de 'pipefail' (p.ej. OTHER_SEARCH, 'realm discover | head', DOM_SECTION,
 #     la medición de desfase NTP, etc.). El valor vacío es el resultado correcto
 #     en esos casos y los chequeos posteriores ya lo contemplan.
+#   · chrony: se añade 'confdir /etc/chrony.d' a /etc/chrony.conf (RHEL no lo
+#     trae por defecto y ad-domain.conf quedaba sin cargar, dejando al equipo
+#     sin fuentes NTP) y se verifica que chrony seleccione al NTP corporativo.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 # ---------------------------------------------------------------- constantes
@@ -401,6 +404,16 @@ mkdir -p /etc/chrony.d
   for dc in "${CORP_NTP[@]}"; do echo "server ${dc} iburst trust prefer"; done
   echo "makestep 1.0 -1"        # corrige saltos grandes siempre, no solo al arrancar
 } > /etc/chrony.d/ad-domain.conf
+# [RHEL] El chrony.conf por defecto de RHEL/Rocky/Alma 8 y 9 NO lee /etc/chrony.d
+# (a diferencia de Debian/Ubuntu, que traen 'confdir /etc/chrony/conf.d'). Sin
+# esta línea ad-domain.conf se ignora y, como abajo se comentan los pool/server
+# públicos, chrony queda SIN NINGUNA fuente: el reloj deriva libremente hasta que
+# Kerberos falla por desfase (KRB5KRB_AP_ERR_SKEW) semanas después del join.
+if ! grep -qE '^\s*(confdir|include)\s+/etc/chrony\.d' /etc/chrony.conf 2>/dev/null; then
+  backup /etc/chrony.conf
+  echo "confdir /etc/chrony.d   # añadido por ad-join-linux-redhat.sh (carga ad-domain.conf)" >> /etc/chrony.conf
+  ok "chrony.conf ahora carga /etc/chrony.d (confdir)"
+fi
 # Los pool/server públicos de la config por defecto compiten con los DCs: chrony
 # marcaría a los DCs como 'falseticker' y no seguiría la hora del dominio.
 if grep -qE '^\s*(pool|server)\s' /etc/chrony.conf 2>/dev/null; then
@@ -415,6 +428,34 @@ chronyc -a makestep >/dev/null 2>&1 || true   # salto inmediato
 sleep 2
 SKEW="$(chronyc tracking 2>/dev/null | awk -F'[ ]+' '/System time/{print $4}' || true)"
 [[ -n "$SKEW" ]] && ok "desfase respecto a las fuentes configuradas: ${SKEW}s"
+# El desfase de arriba NO prueba nada si chrony no tiene fuentes: sin fuentes
+# 'System time' vale ~0 y parece correcto. Se exige que chrony liste al NTP
+# corporativo y que lo seleccione (^* o ^+) en un plazo razonable.
+# corp_ntp_state → "selected" | "listed" | "missing"
+corp_ntp_state() {
+  local src st=missing ntp
+  src="$(chronyc -n sources 2>/dev/null || true)"
+  for ntp in "${CORP_NTP[@]}"; do
+    if awk -v ip="$ntp" '$2==ip && $1 ~ /^\^[*+]/{f=1} END{exit !f}' <<<"$src"; then
+      echo selected; return 0
+    fi
+    awk -v ip="$ntp" '$2==ip{f=1} END{exit !f}' <<<"$src" && st=listed
+  done
+  echo "$st"
+}
+NTP_STATE=missing
+for _ in $(seq 1 15); do
+  NTP_STATE="$(corp_ntp_state)"
+  [[ "$NTP_STATE" == selected ]] && break
+  sleep 2
+done
+case "$NTP_STATE" in
+  selected) ok "chrony sincroniza contra el NTP corporativo:"
+            chronyc -n sources 2>/dev/null | sed -n '3,$p' | sed 's/^/       /' || true ;;
+  listed)   warn "chrony conoce a ${CORP_NTP[*]} pero aún no los selecciona (¿123/udp filtrado?)."
+            warn "Revisa: chronyc -n sources   chronyc -n sourcestats" ;;
+  *)        die "chrony NO tiene como fuente a ${CORP_NTP[*]}: /etc/chrony.d/ad-domain.conf no se está cargando. Revisa 'confdir /etc/chrony.d' en /etc/chrony.conf." ;;
+esac
 # Lo que decide si Kerberos funciona es el desfase contra el reloj del dominio,
 # no contra la hora UTC real. Se mide por NTP contra el servidor corporativo.
 DC1="${CORP_NTP[0]}"
@@ -932,6 +973,18 @@ if command -v sssctl >/dev/null 2>&1; then
     *)         warn "no se pudo determinar el estado Online del backend (sssctl domain-status)." ;;
   esac
 fi
+
+# --- 12.c2 Reloj sincronizado con el NTP corporativo -------------------------
+# Hoy el reloj puede estar bien y Kerberos funcionar, pero si chrony no tiene al
+# NTP corporativo como fuente el desfase crece hasta romper el login más
+# adelante. Se avisa sin contarlo como fallo duro: no impide entrar HOY.
+step "Reloj sincronizado con el NTP corporativo"
+case "$(corp_ntp_state)" in
+  selected) ok "chrony sigue a ${CORP_NTP[*]} ($(timedatectl show -p NTPSynchronized --value 2>/dev/null | sed 's/yes/sincronizado/;s/no/convergiendo/'))" ;;
+  listed)   warn "chrony tiene a ${CORP_NTP[*]} pero no los selecciona: revisa 'chronyc -n sources' y 123/udp." ;;
+  *)        warn "chrony NO usa el NTP corporativo: falta 'confdir /etc/chrony.d' en /etc/chrony.conf."
+            warn "Kerberos dejará de funcionar cuando el reloj se desvíe más de 300 s." ;;
+esac
 
 # --- 12.d Resolución NSS real + contraste con InfoPipe -----------------------
 # Se prueba por NSS ('getent', el camino que usan sshd/login), no sólo 'id'. Si
